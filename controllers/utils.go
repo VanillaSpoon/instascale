@@ -135,3 +135,8 @@ func contains(s []string, str string) bool {
 
 	return false
 }
+
+func hasAwLabel(labels map[string]string, aw *arbv1.AppWrapper) bool {
+	value, ok := labels[aw.Name]
+	return ok && value == aw.Name
+}

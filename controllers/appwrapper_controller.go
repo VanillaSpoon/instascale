@@ -18,10 +18,9 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"strings"
-	"time"
-
+	ocmsdk "github.com/openshift-online/ocm-sdk-go"
 	"github.com/project-codeflare/instascale/pkg/config"
 	arbv1 "github.com/project-codeflare/multi-cluster-app-dispatcher/pkg/apis/controller/v1beta1"
 	corev1 "k8s.io/api/core/v1"
@@ -30,6 +29,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog"
+	"strings"
+	"time"
 
 	"k8s.io/apimachinery/pkg/labels"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -38,15 +39,24 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
+type MachineType string
+
+type ClusterInfo struct {
+	Hypershift struct {
+		Enabled bool `json:"enabled"`
+	} `json:"hypershift"`
+}
+
 // AppWrapperReconciler reconciles a AppWrapper object
 type AppWrapperReconciler struct {
 	client.Client
-	Scheme         *runtime.Scheme
-	Config         config.InstaScaleConfiguration
-	kubeClient     *kubernetes.Clientset
-	ocmClusterID   string
-	ocmToken       string
-	useMachineSets bool
+	Scheme        *runtime.Scheme
+	Config        config.InstaScaleConfiguration
+	kubeClient    *kubernetes.Clientset
+	ocmClusterID  string
+	ocmToken      string
+	ocmConnection *ocmsdk.Connection
+	MachineType   MachineType
 }
 
 var (
@@ -55,9 +65,12 @@ var (
 )
 
 const (
-	namespaceToList = "openshift-machine-api"
-	minResyncPeriod = 10 * time.Minute
-	finalizerName   = "instascale.codeflare.dev/finalizer"
+	namespaceToList                    = "openshift-machine-api"
+	minResyncPeriod                    = 10 * time.Minute
+	finalizerName                      = "instascale.codeflare.dev/finalizer"
+	MachineTypeMachineSet  MachineType = "MachineSet"
+	MachineTypeMachinePool MachineType = "MachinePool"
+	MachineTypeNodePool    MachineType = "NodePool"
 )
 
 // +kubebuilder:rbac:groups=workload.codeflare.dev,resources=appwrappers,verbs=get;list;watch;create;update;patch;delete
@@ -81,13 +94,12 @@ const (
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.11.0/pkg/reconcile
 func (r *AppWrapperReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-
 	_ = log.FromContext(ctx)
 	// todo: Move the getOCMClusterID call out of reconcile loop.
 	// Only reason we are calling it here is that the client is not able to make
 	// calls until it is started, so SetupWithManager is not working.
-	if !r.useMachineSets && r.ocmClusterID == "" {
-		if err := r.getOCMClusterID(ctx); err != nil {
+	if r.MachineType != MachineTypeMachineSet && r.ocmClusterID == "" {
+		if err := r.getOCMClusterID(); err != nil {
 			return ctrl.Result{Requeue: true, RequeueAfter: timeFiveSeconds}, err
 		}
 	}
@@ -124,8 +136,14 @@ func (r *AppWrapperReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	demandPerInstanceType := r.discoverInstanceTypes(&appwrapper)
 	if ocmSecretRef := r.Config.OCMSecretRef; ocmSecretRef != nil {
-		return r.scaleMachinePool(ctx, &appwrapper, demandPerInstanceType)
+		switch r.MachineType {
+		case MachineTypeNodePool:
+			return r.scaleNodePool(ctx, &appwrapper, demandPerInstanceType)
+		case MachineTypeMachinePool:
+			return r.scaleMachinePool(ctx, &appwrapper, demandPerInstanceType)
+		}
 	} else {
+		// use MachineSets
 		switch strings.ToLower(r.Config.MachineSetsStrategy) {
 		case "reuse":
 			return r.reconcileReuseMachineSet(ctx, &appwrapper, demandPerInstanceType)
@@ -142,7 +160,8 @@ func (r *AppWrapperReconciler) finalizeScalingDownMachines(ctx context.Context, 
 	} else {
 		deletionMessage = "deleted"
 	}
-	if r.useMachineSets {
+	switch r.MachineType {
+	case MachineTypeMachineSet:
 		switch strings.ToLower(r.Config.MachineSetsStrategy) {
 		case "reuse":
 			matchedAw := r.findExactMatch(ctx, appwrapper)
@@ -163,7 +182,14 @@ func (r *AppWrapperReconciler) finalizeScalingDownMachines(ctx context.Context, 
 				return err
 			}
 		}
-	} else {
+
+	case MachineTypeNodePool:
+		klog.Infof("Appwrapper %s scale-down node pool: %s ", deletionMessage, appwrapper.Name)
+		if _, err := r.deleteNodePool(ctx, appwrapper); err != nil {
+			return err
+		}
+
+	case MachineTypeMachinePool:
 		klog.Infof("Appwrapper %s scale-down machine pool: %s ", deletionMessage, appwrapper.Name)
 		if _, err := r.deleteMachinePool(ctx, appwrapper); err != nil {
 			return err
@@ -184,20 +210,24 @@ func (r *AppWrapperReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Ma
 	}
 
 	maxScaleNodesAllowed = int(r.Config.MaxScaleoutAllowed)
-	r.useMachineSets = true
+	r.MachineType = MachineTypeMachineSet // default to MachineSet
 	if ocmSecretRef := r.Config.OCMSecretRef; ocmSecretRef != nil {
-		r.useMachineSets = false
 		if ocmSecret, err := r.getOCMSecret(ctx, ocmSecretRef); err != nil {
 			return fmt.Errorf("error reading OCM Secret from ref %q: %w", ocmSecretRef, err)
 		} else if token := ocmSecret.Data["token"]; len(token) > 0 {
 			r.ocmToken = string(token)
+
+			hypershiftEnabled, err := r.checkHypershiftEnabled(ctx)
+			if err != nil {
+				return fmt.Errorf("error checking if hypershift is enabled: %w", err)
+			}
+			if hypershiftEnabled {
+				r.MachineType = MachineTypeNodePool
+			} else {
+				r.MachineType = MachineTypeMachinePool
+			}
 		} else {
 			return fmt.Errorf("token is missing from OCM Secret %q", ocmSecretRef)
-		}
-		if ok, err := r.machinePoolExists(); err != nil {
-			return err
-		} else if ok {
-			klog.Info("Using machine pools for cluster auto-scaling")
 		}
 	}
 
@@ -205,6 +235,74 @@ func (r *AppWrapperReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Ma
 		For(&arbv1.AppWrapper{}).
 		Complete(r)
 }
+
+func (r *AppWrapperReconciler) checkHypershiftEnabled(ctx context.Context) (bool, error) {
+	fmt.Printf("Creating OCM connection")
+	connection, err := r.createOCMConnection()
+	if err != nil {
+		return false, fmt.Errorf("error creating OCM connection: %w", err)
+	}
+	defer connection.Close()
+
+	fmt.Printf("Getting cluster resource for cluster ID: %s\n", r.ocmClusterID)
+	clusterResource := connection.ClustersMgmt().V1().Clusters().Cluster(r.ocmClusterID)
+
+	fmt.Println("Fetching the cluster")
+	response, err := clusterResource.Get().SendContext(ctx)
+	if err != nil {
+		return false, fmt.Errorf("error fetching cluster details: %w", err)
+	}
+
+	fmt.Println("Getting the body from the response")
+	body := response.Body()
+	if body == nil {
+		return false, fmt.Errorf("empty response body")
+	}
+
+	fmt.Println("Marshaling the body into JSON bytes")
+	jsonBytes, err := json.Marshal(body)
+	if err != nil {
+		return false, fmt.Errorf("error marshaling response body to JSON: %w", err)
+	}
+
+	fmt.Println("Unmarshaling JSON into the ClusterInfo struct")
+	var clusterInfo ClusterInfo
+	err = json.Unmarshal(jsonBytes, &clusterInfo)
+	if err != nil {
+		return false, fmt.Errorf("error unmarshaling JSON to struct: %w", err)
+	}
+	fmt.Printf("Contents of 'clusterInfo' field: %+v\n", clusterInfo.Hypershift)
+	fmt.Printf("Contents of 'hypershift' field: %+v\n", clusterInfo.Hypershift)
+	fmt.Printf("Hypershift enabled status: %v\n", clusterInfo.Hypershift.Enabled)
+	return true, nil
+}
+
+/*
+func (r *AppWrapperReconciler) checkHypershiftEnabled(ctx context.Context) (bool, error) {
+    connection, err := r.createOCMConnection()
+    if err != nil {
+        return false, fmt.Errorf("error creating OCM connection: %w", err)
+    }
+    defer connection.Close()
+
+    hypershiftResource := connection.ClustersMgmt().V1().Clusters().Cluster(r.ocmClusterID).Hypershift()
+
+    response, err := hypershiftResource.Get().SendContext(ctx)
+    if err != nil {
+        return false, fmt.Errorf("error fetching Hypershift status: %w", err)
+    }
+
+    body := response.Body()
+    if body == nil {
+        return false, fmt.Errorf("empty response body")
+    }
+
+    // Call the 'Enabled' function to get the status.
+    hypershiftStatus := body.Enabled()
+
+    return hypershiftStatus, nil
+}
+*/
 
 func (r *AppWrapperReconciler) getOCMSecret(ctx context.Context, secretRef *corev1.SecretReference) (*corev1.Secret, error) {
 	return r.kubeClient.CoreV1().Secrets(secretRef.Namespace).Get(ctx, secretRef.Name, metav1.GetOptions{})
